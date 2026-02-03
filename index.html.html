@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vehicle Monitoring – Live ESP32</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<style>
+body { margin:0; font-family: Arial; }
+#map { height:400px; }  
+#statusBox { padding:10px; background:#f0f0f0; font-size:16px; }
+#light { width:20px;height:20px;display:inline-block;border-radius:50%;background:gray;margin-left:10px; }
+#controls { padding:10px; background:#e0e0e0; }
+#violationLog { max-height:200px; overflow-y:auto; margin:10px; border:1px solid #ccc; }
+table { width:100%; border-collapse: collapse; }
+th,td { border:1px solid #aaa; padding:5px; text-align:center; }
+input { margin: 0 5px; }
+</style>
+</head>
+
+<body>
+
+<div id="statusBox">
+  Speed: <span id="speedValue">0</span> km/h
+  <div id="light"></div>
+  <div id="zoneMessage">Normal Road</div>
+  <div>Total Fine: ₹<span id="fineValue">0</span></div>
+</div>
+
+<div id="controls">
+  <label>Zone Type:
+    <select id="geofenceType">
+      <option value="school">School</option>
+      <option value="hospital">Hospital</option>
+      <option value="playground">Playground</option>
+      <option value="residential">Residential</option>
+    </select>
+  </label>
+
+  <label>Start Lat:
+    <input type="number" id="geofenceLatStart" step="0.000001" value="10.994519">
+  </label>
+
+  <label>Start Lng:
+    <input type="number" id="geofenceLngStart" step="0.000001" value="77.083582">
+  </label>
+
+  <label>End Lat:
+    <input type="number" id="geofenceLatEnd" step="0.000001" value="10.995519">
+  </label>
+
+  <label>End Lng:
+    <input type="number" id="geofenceLngEnd" step="0.000001" value="77.084582">
+  </label>
+
+  <label>Speed Limit:
+    <input type="number" id="geofenceSpeed" value="30">
+  </label>
+
+  <button id="addZoneBtn">Add Zone</button>
+</div>
+
+<div id="map"></div>
+
+<div id="violationLog">
+<h3>Violation Log</h3>
+<table>
+<thead>
+<tr>
+  <th>Time</th>
+  <th>Zone</th>
+  <th>Speed</th>
+  <th>Location</th>
+</tr>
+</thead>
+<tbody id="logBody"></tbody>
+</table>
+</div>
+
+<audio id="alertSound">
+  <source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg">
+</audio>
+
+<!-- 🔥 Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-app.js";
+import { getDatabase, ref, onValue, update, set } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-database.js";
+
+/* 🔴 FIREBASE CONFIG */
+const firebaseConfig = {
+  apiKey: "1:595022485323:web:af84d56b435d7f1f173ace",
+  authDomain: "speed-alert-fd1be.firebaseapp.com",
+  databaseURL: "https://speed-alert-fd1be-default-rtdb.firebaseio.com",
+  projectId: "speed-alert-fd1be"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+/* 🗺️ MAP */
+const map = L.map('map').setView([10.994519,77.083582],15);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+const vehicleMarker = L.marker([0,0]).addTo(map);
+
+/* 🎯 ZONES */
+const geofences = [];
+const colors = {
+  school:'blue',
+  hospital:'green',
+  playground:'orange',
+  residential:'brown'
+};
+
+/* Add rectangle zone using start/end Lat/Lng */
+document.getElementById("addZoneBtn").addEventListener("click", () => {
+  const type = geofenceType.value;
+  const speedLimit = +geofenceSpeed.value;
+  const latStart = +document.getElementById("geofenceLatStart").value;
+  const lngStart = +document.getElementById("geofenceLngStart").value;
+  const latEnd = +document.getElementById("geofenceLatEnd").value;
+  const lngEnd = +document.getElementById("geofenceLngEnd").value;
+
+  // Draw rectangle
+  const bounds = [
+    [latStart, lngStart],
+    [latStart, lngEnd],
+    [latEnd, lngEnd],
+    [latEnd, lngStart]
+  ];
+
+  const rectangle = L.polygon(bounds, {
+    color: colors[type],
+    fillOpacity: 0.2
+  }).addTo(map);
+
+  rectangle.type = type;
+  rectangle.speedLimit = speedLimit;
+  rectangle.name = type.toUpperCase() + " ZONE";
+
+  geofences.push(rectangle);
+
+  // Save zone in Firebase
+  const newZoneRef = ref(db, `zones/${Date.now()}`);
+  set(newZoneRef, {
+    type,
+    speedLimit,
+    latStart,
+    lngStart,
+    latEnd,
+    lngEnd
+  });
+});
+
+/* 🔊 Alert */
+const beep = document.getElementById("alertSound");
+
+/* 💰 Fine */
+let totalFine = 0;
+let violationCount = 0;
+
+/* 📡 GPS DATA LISTENER (Your current Firebase structure) */
+onValue(ref(db,"GPS"), snap => {
+  const d = snap.val();
+  if(!d) return;
+
+  const lat = d.f_latitude;   // updated for your format
+  const lng = d.f_longitude;
+  const speed = d.f_speed * 3.6; // convert m/s to km/h if needed
+
+  vehicleMarker.setLatLng([lat,lng]);
+  map.setView([lat,lng],18);
+
+  speedValue.innerText = speed.toFixed(1);
+
+  let inZone = false;
+
+  for(const z of geofences){
+    if(z.getBounds().contains([lat,lng])){
+      inZone = true;
+      if(speed > z.speedLimit){
+        violationCount++;
+        totalFine += 500;
+
+        light.style.background = "red";
+        zoneMessage.innerText = `🚨 Over-speed in ${z.name}`;
+        fineValue.innerText = totalFine;
+
+        if(!beep.paused){ beep.pause(); beep.currentTime=0; }
+        beep.play();
+
+        logViolation(z, speed, lat, lng);
+
+        if(violationCount >= 3){
+          update(ref(db,"policeAlerts/vehicle1"),{
+            lat,lng,speed,time:new Date().toISOString()
+          });
+        }
+      } else {
+        light.style.background = "green";
+        zoneMessage.innerText = `Safe in ${z.name}`;
+      }
+      break;
+    }
+  }
+
+  if(!inZone){
+    light.style.background = "gray";
+    zoneMessage.innerText = "Normal Road";
+  }
+});
+
+/* 📝 LOG */
+function logViolation(zone, speed, lat, lng){
+  const row = document.createElement("tr");
+  row.innerHTML = `
+    <td>${new Date().toLocaleTimeString()}</td>
+    <td>${zone.type}</td>
+    <td>${speed.toFixed(1)}</td>
+    <td>${lat.toFixed(5)}, ${lng.toFixed(5)}</td>`;
+  logBody.prepend(row);
+}
+</script>
+
+</body>
+</html>
